@@ -16,6 +16,7 @@ from app.models import (
     ProcessingSettings,
     WhisperSettings,
 )
+from app.refresh_schedule import refresh_cron_kwargs
 from app.runtime_config import config as runtime_config
 from shared import defaults as DEFAULTS
 from shared.config import Config as PydanticConfig
@@ -622,6 +623,10 @@ def _maybe_reschedule_refresh_job(
     old_interval: Optional[int], new_interval: Optional[int]
 ) -> None:
     if old_interval == new_interval:
+        return
+
+    # A fixed-time schedule from the environment wins over the UI interval.
+    if refresh_cron_kwargs() is not None:
         return
 
     job_id = "refresh_all_feeds"
