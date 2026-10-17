@@ -1,8 +1,9 @@
 """Conservative acoustic cue matching for Podly experiments.
 
-The detector decodes audio through ffmpeg, then performs chunked normalized
-cross-correlation against a short PCM cue. It reports matches only; it never
-decides or applies cuts on its own.
+The detector streams audio decoded by ffmpeg and performs chunked normalized
+cross-correlation against a short PCM cue, keeping only one chunk plus a
+cue-length overlap in memory. It reports matches only; it never decides or
+applies cuts on its own.
 """
 
 from __future__ import annotations
@@ -11,9 +12,10 @@ import argparse
 import json
 import math
 import subprocess
+from contextlib import closing
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 import numpy as np
 
@@ -33,8 +35,8 @@ class AcousticPlan:
     reason: str
 
 
-def decode_audio(path: Path, sample_rate: int) -> np.ndarray:
-    command = [
+def _decode_command(path: Path, sample_rate: int) -> list[str]:
+    return [
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
@@ -50,11 +52,34 @@ def decode_audio(path: Path, sample_rate: int) -> np.ndarray:
         "f32le",
         "pipe:1",
     ]
+
+
+def decode_audio(path: Path, sample_rate: int) -> np.ndarray:
+    command = _decode_command(path, sample_rate)
     completed = subprocess.run(command, check=True, stdout=subprocess.PIPE)
     samples = np.frombuffer(completed.stdout, dtype="<f4").astype(np.float64)
     if samples.size == 0:
         raise ValueError(f"No audio samples decoded from {path}")
     return samples
+
+
+def iter_audio_blocks(
+    path: Path, sample_rate: int, block_samples: int
+) -> Iterator[np.ndarray]:
+    """Yield float64 sample blocks straight from the ffmpeg pipe."""
+    command = _decode_command(path, sample_rate)
+    block_bytes = block_samples * 4
+    with subprocess.Popen(command, stdout=subprocess.PIPE) as proc:
+        assert proc.stdout is not None
+        while True:
+            data = proc.stdout.read(block_bytes)
+            if not data:
+                break
+            usable = len(data) - len(data) % 4
+            yield np.frombuffer(data[:usable], dtype="<f4").astype(np.float64)
+        returncode = proc.wait()
+    if returncode:
+        raise subprocess.CalledProcessError(returncode, command)
 
 
 def _next_power_of_two(value: int) -> int:
@@ -102,45 +127,119 @@ def _cluster_peaks(
     return sorted(selected)
 
 
-def find_cue_matches(
-    audio: np.ndarray,
+def _chunk_samples(cue: np.ndarray, sample_rate: int, chunk_seconds: float) -> int:
+    return max(cue.size * 2, int(chunk_seconds * sample_rate))
+
+
+def _owned_candidates(
+    segment: np.ndarray,
+    cue: np.ndarray,
+    *,
+    global_start: int,
+    segment_start: int,
+    owned_end: int,
+    threshold: float,
+) -> list[tuple[int, float]]:
+    scores = _normalized_scores(segment, cue)
+    local_owned_start = global_start - segment_start
+    local_owned_end = owned_end - segment_start
+    owned_scores = scores[local_owned_start:local_owned_end]
+    above = np.flatnonzero(owned_scores >= threshold)
+    if above.size == 0:
+        return []
+
+    candidates: list[tuple[int, float]] = []
+    contiguous_groups = np.split(above, np.where(np.diff(above) > 1)[0] + 1)
+    for group in contiguous_groups:
+        group_scores = owned_scores[group]
+        best_offset = int(group[int(np.argmax(group_scores))])
+        candidates.append(
+            (global_start + best_offset, float(owned_scores[best_offset]))
+        )
+    return candidates
+
+
+def scan_cue_matches(
+    blocks: Iterable[np.ndarray],
     cue: np.ndarray,
     *,
     sample_rate: int,
     threshold: float,
     chunk_seconds: float = 90.0,
     min_distance_seconds: float = 1.0,
-) -> list[CueMatch]:
+) -> tuple[list[CueMatch], int]:
+    """Match ``cue`` against audio arriving as consecutive sample blocks.
+
+    Chunk boundaries, segments (owned chunk plus ``cue.size - 1`` samples of
+    overlap on each side) and offsets are exactly those of a whole-buffer scan,
+    so results are identical while memory stays bounded to roughly two chunks.
+    Returns the matches and the total number of samples seen.
+    """
     if not 0.0 < threshold <= 1.0:
         raise ValueError("threshold must be in (0, 1]")
-    if cue.size >= audio.size:
-        return []
 
-    chunk_samples = max(cue.size * 2, int(chunk_seconds * sample_rate))
-    last_start = audio.size - cue.size
+    chunk_samples = _chunk_samples(cue, sample_rate, chunk_seconds)
+    overlap = cue.size - 1
+    block_iter = iter(blocks)
+    buffer = np.empty(0, dtype=np.float64)
+    buffer_start = 0
+    total_samples = 0
+    exhausted = False
+    global_start = 0
     candidates: list[tuple[int, float]] = []
 
-    for global_start in range(0, last_start + 1, chunk_samples):
-        owned_end = min(global_start + chunk_samples, last_start + 1)
-        segment_start = max(0, global_start - cue.size + 1)
-        segment_end = min(audio.size, owned_end + cue.size - 1)
-        segment = audio[segment_start:segment_end]
-        scores = _normalized_scores(segment, cue)
-
-        local_owned_start = global_start - segment_start
-        local_owned_end = owned_end - segment_start
-        owned_scores = scores[local_owned_start:local_owned_end]
-        above = np.flatnonzero(owned_scores >= threshold)
-        if above.size == 0:
-            continue
-
-        contiguous_groups = np.split(above, np.where(np.diff(above) > 1)[0] + 1)
-        for group in contiguous_groups:
-            group_scores = owned_scores[group]
-            best_offset = int(group[int(np.argmax(group_scores))])
-            candidates.append(
-                (global_start + best_offset, float(owned_scores[best_offset]))
+    def scan(owned_end: int, segment_end: int) -> None:
+        segment_start = max(0, global_start - overlap)
+        segment = buffer[segment_start - buffer_start : segment_end - buffer_start]
+        candidates.extend(
+            _owned_candidates(
+                segment,
+                cue,
+                global_start=global_start,
+                segment_start=segment_start,
+                owned_end=owned_end,
+                threshold=threshold,
             )
+        )
+
+    def advance() -> None:
+        nonlocal global_start, buffer, buffer_start
+        global_start += chunk_samples
+        keep_from = max(0, global_start - overlap)
+        buffer = buffer[keep_from - buffer_start :]
+        buffer_start = keep_from
+
+    # Full chunks: enough samples are buffered to know the chunk is not the last.
+    while True:
+        needed_end = global_start + chunk_samples + overlap
+        pending = [buffer]
+        available_end = buffer_start + buffer.size
+        while available_end < needed_end:
+            try:
+                block = next(block_iter)
+            except StopIteration:
+                exhausted = True
+                break
+            pending.append(block)
+            available_end += block.size
+            total_samples += block.size
+        if len(pending) > 1:
+            buffer = np.concatenate(pending)
+        if exhausted:
+            break
+        scan(global_start + chunk_samples, needed_end)
+        advance()
+
+    # Tail: the total length is now known.
+    if total_samples == 0:
+        raise ValueError("No audio samples decoded")
+    if cue.size >= total_samples:
+        return [], total_samples
+    last_start = total_samples - cue.size
+    while global_start <= last_start:
+        owned_end = min(global_start + chunk_samples, last_start + 1)
+        scan(owned_end, min(total_samples, owned_end + overlap))
+        advance()
 
     peaks = _cluster_peaks(
         candidates, max(1, int(min_distance_seconds * sample_rate))
@@ -153,7 +252,58 @@ def find_cue_matches(
             confidence=round(score, 6),
         )
         for sample_index, score in peaks
-    ]
+    ], total_samples
+
+
+def find_cue_matches(
+    audio: np.ndarray,
+    cue: np.ndarray,
+    *,
+    sample_rate: int,
+    threshold: float,
+    chunk_seconds: float = 90.0,
+    min_distance_seconds: float = 1.0,
+) -> list[CueMatch]:
+    if cue.size >= audio.size:
+        if not 0.0 < threshold <= 1.0:
+            raise ValueError("threshold must be in (0, 1]")
+        return []
+    matches, _ = scan_cue_matches(
+        [audio],
+        cue,
+        sample_rate=sample_rate,
+        threshold=threshold,
+        chunk_seconds=chunk_seconds,
+        min_distance_seconds=min_distance_seconds,
+    )
+    return matches
+
+
+def detect_cue_matches(
+    audio_path: Path,
+    cue: np.ndarray,
+    *,
+    sample_rate: int,
+    threshold: float,
+    chunk_seconds: float = 90.0,
+) -> tuple[list[CueMatch], int]:
+    """Stream ``audio_path`` through ffmpeg and match ``cue`` chunk by chunk."""
+    blocks = iter_audio_blocks(
+        audio_path, sample_rate, _chunk_samples(cue, sample_rate, chunk_seconds)
+    )
+    try:
+        with closing(blocks):
+            return scan_cue_matches(
+                blocks,
+                cue,
+                sample_rate=sample_rate,
+                threshold=threshold,
+                chunk_seconds=chunk_seconds,
+            )
+    except ValueError as exc:
+        if str(exc) == "No audio samples decoded":
+            raise ValueError(f"No audio samples decoded from {audio_path}") from exc
+        raise
 
 
 def plan_conservative_cuts(
@@ -230,17 +380,16 @@ def detect_and_plan(
     sample_rate: int = 4000,
     threshold: float = 0.90,
 ) -> AcousticPlan:
-    audio = decode_audio(audio_path, sample_rate)
     cue = decode_audio(cue_path, sample_rate)
-    matches = find_cue_matches(
-        audio,
+    matches, total_samples = detect_cue_matches(
+        audio_path,
         cue,
         sample_rate=sample_rate,
         threshold=threshold,
     )
     return plan_conservative_cuts(
         matches,
-        audio_duration_seconds=audio.size / sample_rate,
+        audio_duration_seconds=total_samples / sample_rate,
     )
 
 
@@ -252,22 +401,21 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=0.72)
     args = parser.parse_args()
 
-    audio = decode_audio(args.audio, args.sample_rate)
     cue = decode_audio(args.cue, args.sample_rate)
-    matches = find_cue_matches(
-        audio,
+    matches, total_samples = detect_cue_matches(
+        args.audio,
         cue,
         sample_rate=args.sample_rate,
         threshold=args.threshold,
     )
     plan = plan_conservative_cuts(
         matches,
-        audio_duration_seconds=audio.size / args.sample_rate,
+        audio_duration_seconds=total_samples / args.sample_rate,
     )
     print(
         json.dumps(
             {
-                "audio_duration_seconds": round(audio.size / args.sample_rate, 3),
+                "audio_duration_seconds": round(total_samples / args.sample_rate, 3),
                 "cue_duration_seconds": round(cue.size / args.sample_rate, 3),
                 "threshold": args.threshold,
                 "matches": [asdict(match) for match in matches],
