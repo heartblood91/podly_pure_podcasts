@@ -130,6 +130,19 @@ def create_web_app() -> Flask:
     )
 
 
+def create_job_runner_app() -> Flask:
+    """Create the app used by a per-episode job child process.
+
+    Read-only like the web app (writes go through the writer), without
+    startup bootstrapping or a scheduler.
+    """
+    return _create_configured_app(
+        app_role="web",
+        run_startup=False,
+        start_scheduler=False,
+    )
+
+
 def create_writer_app() -> Flask:
     """Create the writer Flask app.
 

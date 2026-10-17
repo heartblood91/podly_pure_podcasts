@@ -1,6 +1,9 @@
 import logging
 import os
+import subprocess
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any, Dict, List, Optional, Tuple, cast
 
@@ -11,6 +14,7 @@ from app.extensions import db as _db
 from app.extensions import scheduler
 from app.feeds import refresh_feed
 from app.job_manager import JobManager as SingleJobManager
+from app.logger import default_log_file
 from app.models import Feed, JobsManagerRun, Post, ProcessingJob
 from app.processor import get_processor
 from app.writer.client import writer_client
@@ -633,6 +637,8 @@ class JobsManager:
         """Execute a single job using the processor.
 
         Uses a global processing lock to absolutely guarantee single-job execution.
+        By default the job runs in a short-lived child process so the memory used
+        by decoding and processing is returned to the OS when the episode is done.
         """
         # Acquire global lock to ensure only one job runs at a time
         logger.info(
@@ -646,98 +652,164 @@ class JobsManager:
                 job_id,
                 post_guid,
             )
-            with scheduler.app.app_context():
-                with db_guard("process_job", _db.session, logger):
-                    try:
-                        # Clear any failed transaction state from prior work on this session.
-                        try:
-                            _db.session.rollback()
-                        except Exception:  # pylint: disable=broad-except
-                            pass
-
-                        # Expire all cached objects to ensure fresh reads
-                        _db.session.expire_all()
-
-                        logger.debug(
-                            "Worker starting job_id=%s post_guid=%s", job_id, post_guid
-                        )
-                        worker_post = Post.query.filter_by(guid=post_guid).first()
-                        if not worker_post:
-                            logger.error(
-                                "Post with GUID %s not found; failing job %s",
-                                post_guid,
-                                job_id,
-                            )
-                            job = _db.session.get(ProcessingJob, job_id)
-                            if job:
-                                self._status_manager.update_job_status(
-                                    job,
-                                    "failed",
-                                    job.current_step or 0,
-                                    "Post not found",
-                                    0.0,
-                                )
-                            return
-
-                        def _cancelled() -> bool:
-                            # Expire the job before re-querying to get fresh state
-                            _db.session.expire_all()
-                            current_job = _db.session.get(ProcessingJob, job_id)
-                            return (
-                                current_job is None or current_job.status == "cancelled"
-                            )
-
-                        get_processor().process(
-                            worker_post, job_id=job_id, cancel_callback=_cancelled
-                        )
-                    except ProcessorException as exc:
-                        logger.info(
-                            "Job %s finished with processor exception: %s", job_id, exc
-                        )
-                    except Exception as exc:  # pylint: disable=broad-except
-                        logger.error(
-                            "Unexpected error in job %s: %s", job_id, exc, exc_info=True
-                        )
-                        try:
-                            _db.session.expire_all()
-                            failed_job = _db.session.get(ProcessingJob, job_id)
-                            if failed_job and failed_job.status not in [
-                                "completed",
-                                "cancelled",
-                                "failed",
-                            ]:
-                                self._status_manager.update_job_status(
-                                    failed_job,
-                                    "failed",
-                                    failed_job.current_step or 0,
-                                    f"Job execution failed: {exc}",
-                                    failed_job.progress_percentage or 0.0,
-                                )
-                        except (
-                            Exception
-                        ) as cleanup_error:  # pylint: disable=broad-except
-                            logger.error(
-                                "Failed to update job status after error: %s",
-                                cleanup_error,
-                                exc_info=True,
-                            )
-                    finally:
-                        # Always clean up session state after job processing to release any locks
-                        try:
-                            _db.session.rollback()
-                        except Exception:  # pylint: disable=broad-except
-                            pass
-                        try:
-                            _db.session.remove()
-                        except Exception as exc:  # pylint: disable=broad-except
-                            logger.warning(
-                                "Failed to remove session after job: %s", exc
-                            )
+            if job_subprocess_enabled():
+                self._process_job_in_subprocess(job_id, post_guid)
+            else:
+                with scheduler.app.app_context():
+                    run_job(job_id, post_guid, self._status_manager)
             logger.info(
                 "[JOB_PROCESS] Released processing lock: job_id=%s post_guid=%s",
                 job_id,
                 post_guid,
             )
+
+    def _process_job_in_subprocess(self, job_id: str, post_guid: str) -> None:
+        timeout = job_timeout_seconds()
+        try:
+            returncode = subprocess.run(
+                job_runner_command(job_id, post_guid),
+                env=job_runner_env(),
+                timeout=timeout,
+                check=False,
+            ).returncode
+        except subprocess.TimeoutExpired:
+            message = f"Job process timed out after {timeout:g}s"
+        except OSError as exc:
+            message = f"Job process could not start: {exc}"
+        else:
+            if returncode == 0:
+                return
+            message = f"Job process exited with code {returncode}"
+
+        logger.error("[JOB_PROCESS] %s: job_id=%s", message, job_id)
+        with scheduler.app.app_context():
+            try:
+                mark_job_failed(job_id, message, self._status_manager)
+            finally:
+                _remove_session()
+
+
+def job_subprocess_enabled() -> bool:
+    return os.environ.get("PODLY_JOB_SUBPROCESS", "1") != "0"
+
+
+def job_timeout_seconds() -> Optional[float]:
+    raw = os.environ.get("PODLY_JOB_TIMEOUT_SECONDS", "14400")
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def job_runner_command(job_id: str, post_guid: str) -> List[str]:
+    return [sys.executable, "-m", "app.job_runner", job_id, post_guid]
+
+
+def job_runner_env() -> Dict[str, str]:
+    env = dict(os.environ)
+    src_dir = str(Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (src_dir, env.get("PYTHONPATH")) if part
+    )
+    # Jobs run one at a time, so the child can safely own (and rotate) its log.
+    env.setdefault(
+        "PODLY_JOB_LOG_FILE",
+        str(Path(default_log_file()).with_name("jobs.log")),
+    )
+    env["PODLY_LOG_FILE"] = env["PODLY_JOB_LOG_FILE"]
+    return env
+
+
+def _remove_session() -> None:
+    # Always clean up session state after job processing to release any locks
+    try:
+        _db.session.rollback()
+    except Exception:  # pylint: disable=broad-except
+        pass
+    try:
+        _db.session.remove()
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning("Failed to remove session after job: %s", exc)
+
+
+def mark_job_failed(
+    job_id: str, message: str, status_manager: ProcessingStatusManager
+) -> None:
+    """Fail a job unless it already reached a terminal state."""
+    try:
+        _db.session.expire_all()
+        failed_job = _db.session.get(ProcessingJob, job_id)
+        if failed_job and failed_job.status not in [
+            "completed",
+            "cancelled",
+            "failed",
+        ]:
+            status_manager.update_job_status(
+                failed_job,
+                "failed",
+                failed_job.current_step or 0,
+                message,
+                failed_job.progress_percentage or 0.0,
+            )
+    except Exception as cleanup_error:  # pylint: disable=broad-except
+        logger.error(
+            "Failed to update job status after error: %s",
+            cleanup_error,
+            exc_info=True,
+        )
+
+
+def run_job(
+    job_id: str, post_guid: str, status_manager: ProcessingStatusManager
+) -> None:
+    """Process one job inside the current app context."""
+    with db_guard("process_job", _db.session, logger):
+        try:
+            # Clear any failed transaction state from prior work on this session.
+            try:
+                _db.session.rollback()
+            except Exception:  # pylint: disable=broad-except
+                pass
+
+            # Expire all cached objects to ensure fresh reads
+            _db.session.expire_all()
+
+            logger.debug("Worker starting job_id=%s post_guid=%s", job_id, post_guid)
+            worker_post = Post.query.filter_by(guid=post_guid).first()
+            if not worker_post:
+                logger.error(
+                    "Post with GUID %s not found; failing job %s",
+                    post_guid,
+                    job_id,
+                )
+                job = _db.session.get(ProcessingJob, job_id)
+                if job:
+                    status_manager.update_job_status(
+                        job,
+                        "failed",
+                        job.current_step or 0,
+                        "Post not found",
+                        0.0,
+                    )
+                return
+
+            def _cancelled() -> bool:
+                # Expire the job before re-querying to get fresh state
+                _db.session.expire_all()
+                current_job = _db.session.get(ProcessingJob, job_id)
+                return current_job is None or current_job.status == "cancelled"
+
+            get_processor().process(
+                worker_post, job_id=job_id, cancel_callback=_cancelled
+            )
+        except ProcessorException as exc:
+            logger.info("Job %s finished with processor exception: %s", job_id, exc)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Unexpected error in job %s: %s", job_id, exc, exc_info=True)
+            mark_job_failed(job_id, f"Job execution failed: {exc}", status_manager)
+        finally:
+            _remove_session()
 
 
 # Singleton accessor
