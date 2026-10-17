@@ -27,7 +27,7 @@ from app.extensions import db, migrate, scheduler
 from app.jobs_manager import (
     get_jobs_manager,
 )
-from app.logger import setup_logger
+from app.logger import default_log_file, setup_logger
 from app.processor import (
     ProcessorSingleton,
 )
@@ -36,7 +36,7 @@ from app.runtime_config import config, is_test
 from app.writer.client import writer_client
 from shared.processing_paths import get_in_root, get_srv_root
 
-setup_logger("global_logger", "src/instance/logs/app.log")
+setup_logger("global_logger", default_log_file())
 logger = logging.getLogger("global_logger")
 
 

@@ -152,7 +152,13 @@ class CommandExecutor:
     def process_command(self, cmd: WriteCommand) -> WriteResult:
         with self.app.app_context():
             try:
-                logger.info(
+                is_polling = (
+                    cmd.type == WriteCommandType.ACTION
+                    and isinstance(cmd.data, dict)
+                    and cmd.data.get("action") == "dequeue_job"
+                )
+                logger.log(
+                    logging.DEBUG if is_polling else logging.INFO,
                     "[WRITER] Processing command: id=%s type=%s model=%s",
                     cmd.id,
                     cmd.type,

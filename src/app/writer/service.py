@@ -3,12 +3,12 @@ import threading
 import time
 
 from app.ipc import get_queue, make_server_manager
-from app.logger import setup_logger
+from app.logger import default_log_file, setup_logger
 from app.writer.protocol import WriteCommandType
 
 from .executor import CommandExecutor
 
-logger = setup_logger("writer", "src/instance/logs/app.log", level=logging.INFO)
+logger = setup_logger("writer", default_log_file(), level=logging.INFO)
 
 
 def run_writer_service() -> None:

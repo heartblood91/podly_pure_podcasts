@@ -76,7 +76,11 @@ class JobsManager:
     def _wake_worker(self) -> None:
         self._work_event.set()
 
-    def _wait_for_work(self, timeout: float = 5.0) -> None:
+    def _wait_for_work(self, timeout: Optional[float] = None) -> None:
+        # Enqueues in this process wake the worker immediately; the poll only
+        # catches jobs queued elsewhere, so it can be infrequent.
+        if timeout is None:
+            timeout = float(os.environ.get("PODLY_JOB_POLL_SECONDS", "30"))
         triggered = self._work_event.wait(timeout)
         if triggered:
             self._work_event.clear()

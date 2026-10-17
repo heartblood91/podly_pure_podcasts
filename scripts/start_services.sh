@@ -4,7 +4,8 @@ set -e
 # 1. Start Writer Service in background
 echo "Starting Writer Service..."
 export PYTHONPATH="/app/src${PYTHONPATH:+:$PYTHONPATH}"
-python3 -u -m app.writer &
+# The writer logs to its own file so each process rotates only its own log.
+PODLY_LOG_FILE="src/instance/logs/writer.log" python3 -u -m app.writer &
 WRITER_PID=$!
 
 # Wait for writer IPC to be ready
@@ -44,10 +45,13 @@ echo "Starting Main Application..."
 python3 -u src/main.py &
 APP_PID=$!
 
+trap 'kill "$APP_PID" "$WRITER_PID" 2>/dev/null || true' EXIT INT TERM
+
 # 3. Monitor processes
 # 'wait -n' waits for the first process to exit.
-# If writer dies, we want to exit so Docker restarts us.
-wait -n
+# If either process dies, exit so Docker (restart: unless-stopped) restarts us.
+set +e
+wait -n "$WRITER_PID" "$APP_PID"
 
 # Exit with status of process that exited first
 exit $?

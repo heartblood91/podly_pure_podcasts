@@ -1,6 +1,30 @@
 import json
 import logging
 import os
+from logging.handlers import RotatingFileHandler
+
+DEFAULT_LOG_FILE = "src/instance/logs/app.log"
+DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_LOG_BACKUP_COUNT = 5
+
+
+def default_log_file() -> str:
+    """Per-process log file; the writer gets its own so rotation never races."""
+    return os.environ.get("PODLY_LOG_FILE") or DEFAULT_LOG_FILE
+
+
+def _build_file_handler(path: str) -> logging.FileHandler:
+    # Short-lived helper processes (per-episode jobs) append without rotating so
+    # only the long-lived owner of the file ever renames it.
+    if os.environ.get("PODLY_LOG_ROTATE", "1") == "0":
+        return logging.FileHandler(path)
+    return RotatingFileHandler(
+        path,
+        maxBytes=int(os.environ.get("PODLY_LOG_MAX_BYTES", DEFAULT_LOG_MAX_BYTES)),
+        backupCount=int(
+            os.environ.get("PODLY_LOG_BACKUP_COUNT", DEFAULT_LOG_BACKUP_COUNT)
+        ),
+    )
 
 
 class ExtraFormatter(logging.Formatter):
@@ -81,7 +105,7 @@ def setup_logger(
         for h in logger.handlers
     )
     if not has_file_handler:
-        file_handler = logging.FileHandler(abs_log_file)
+        file_handler = _build_file_handler(abs_log_file)
         file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
 
