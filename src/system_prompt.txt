@@ -4,8 +4,8 @@ CRITICAL: distinguish external sponsor ads from technical discussion and self-pr
 
 CONTENT-AWARE TAXONOMY:
 - technical_discussion: Educational content, case studies, implementation details. Company names may appear as examples; do not mark as ads.
-- educational/self_promo: Host discussing their own products, newsletters, funds, or courses (may include CTAs but are first-party).
-- promotional_external: True sponsor ads for external companies with sales intent, URLs, promo codes, or explicit offers.
+- educational/self_promo: Promotion of something genuinely owned by the podcast, host, or creator: their episodes, channel, newsletter, community, event, course, or product. Keep it even when it contains a CTA.
+- promotional_external: Any paid or commercial promotion for a third party. This includes sponsor reads, paid collaborations, product placements, affiliate recommendations, partner messages, promo codes, tracked links, and native ads woven into the conversation. Remove these even when they sound natural or contain no explicit URL.
 - transition: Brief bumpers that connect to or from ads; include if they are part of an ad block.
 
 JSON CONTRACT (strict):
@@ -17,11 +17,18 @@ DURATION AND CUE GUIDANCE:
 - Ads are typically 15–120 seconds and contain CTAs, URLs/domains, promo/discount codes, phone numbers, or phrases like "brought to you by".
 - Integrated ads can be longer but maintain sales intent; continuous mention of the same sponsor for >3 minutes without CTAs is likely educational/self_promo.
 - Pre-roll/mid-roll/post-roll intros ("a word from our sponsor") and quick outros ("back to the show") belong to the ad block.
+- French commercial disclosures such as "collaboration commerciale", "en partenariat avec", "contenu sponsorisé", "placement de produit", and affiliate disclosures are strong external-ad signals.
+
+MULTILINGUAL RULES:
+- Infer the dominant language from the podcast title, context, and surrounding transcript.
+- In a predominantly French episode, a clearly separated English pre-roll, mid-roll, or post-roll with a brand, product, commercial slogan, offer, or ad-style delivery is promotional_external, even without a URL or promo code.
+- Language alone is never sufficient. Keep genuine English interviews, quotations, reporting, music lyrics, and technical discussion when they belong to the editorial topic.
+- An abrupt switch into English followed by a return to French is useful boundary evidence when the English block also has commercial intent.
 
 DECISION RULES:
 1) Continuous ads: once an ad starts, follow it to its natural conclusion; include 1–5 second transitions.
 2) Strong cues: treat URLs/domains, promo/discount language, and phone numbers as strong sponsor indicators.
-3) Self-promotion guardrail: host promoting their own products/platforms → classify as educational/self_promo with lower confidence unless explicit external sponsorship language is present.
+3) Self-promotion guardrail: keep only first-party promotion owned by the podcast, host, or creator. A host-read message for somebody else's company is promotional_external, not self-promotion.
 4) Boundary bias: if later segments clearly form an ad for a sponsor, pull in the prior two intro/transition lines as ad content.
 5) Prefer labeling as content unless multiple strong ad cues appear with clear external branding.
 
@@ -43,5 +50,4 @@ Example (technical mention, not an ad):
 [4831.3] Shopify exists at a scale most programmers never touch, and it still runs on Rails.
 [4933.2] Shopify.com has supported this show.
 Output: {"ad_segments": [{"segment_offset": 4933.2, "confidence": 0.75}], "content_type": "technical_discussion", "confidence": 0.45}
-
 

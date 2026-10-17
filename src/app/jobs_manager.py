@@ -19,6 +19,9 @@ from podcast_processor.processing_status_manager import ProcessingStatusManager
 
 logger = logging.getLogger("global_logger")
 
+ACAST_DOWNLOAD_RETRY_WINDOW = timedelta(days=7)
+ACAST_DOWNLOAD_RETRY_INTERVAL = timedelta(hours=6)
+
 
 class JobsManager:
     """
@@ -492,6 +495,7 @@ class JobsManager:
         """Ensure all posts have jobs and return counts for monitoring."""
         run_id = active_run.id if active_run else None
         created_jobs = self._ensure_jobs_for_all_posts(run_id)
+        created_jobs += self._requeue_recent_acast_download_failures(run_id)
 
         pending_jobs = (
             ProcessingJob.query.filter(ProcessingJob.status == "pending")
@@ -517,6 +521,52 @@ class JobsManager:
         )
 
         return created_jobs, len(pending_jobs)
+
+    def _requeue_recent_acast_download_failures(
+        self, run_id: Optional[str]
+    ) -> int:
+        """Retry recent Acast episodes after their enclosure becomes available."""
+        now = datetime.utcnow()
+        release_cutoff = now - ACAST_DOWNLOAD_RETRY_WINDOW
+        retry_cutoff = now - ACAST_DOWNLOAD_RETRY_INTERVAL
+        posts = Post.query.filter(
+            Post.whitelisted.is_(True),
+            Post.processed_audio_path.is_(None),
+            Post.release_date >= release_cutoff,
+            Post.download_url.ilike("%acast.com%"),
+        ).all()
+
+        requeued = 0
+        for post in posts:
+            latest_job = (
+                ProcessingJob.query.filter_by(post_guid=post.guid)
+                .order_by(ProcessingJob.created_at.desc())
+                .first()
+            )
+            if (
+                latest_job is None
+                or latest_job.status != "failed"
+                or latest_job.error_message != "Download failed"
+                or latest_job.created_at is None
+                or latest_job.created_at > retry_cutoff
+            ):
+                continue
+
+            result = SingleJobManager(
+                post.guid,
+                self._status_manager,
+                logger,
+                run_id,
+            ).start_processing("scheduled-acast-retry")
+            if result.get("status") == "started":
+                requeued += 1
+                logger.info(
+                    "Requeued recent Acast download failure: post_guid=%s job_id=%s",
+                    post.guid,
+                    result.get("job_id"),
+                )
+
+        return requeued
 
     # Removed _get_active_job_for_guid - now using direct database queries
 

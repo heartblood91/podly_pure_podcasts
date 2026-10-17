@@ -121,8 +121,23 @@ def _get_base_url() -> str:
 def fetch_feed(url: str) -> feedparser.FeedParserDict:
     logger.info(f"Fetching feed from URL: {url}")
     feed_data = feedparser.parse(url)
+    unique_entries = []
+    seen_guids: set[str] = set()
     for entry in feed_data.entries:
-        entry.id = get_guid(entry)
+        guid = get_guid(entry)
+        if guid in seen_guids:
+            logger.warning(
+                "Skipping duplicate podcast episode GUID %s from feed %s",
+                guid,
+                url,
+            )
+            continue
+
+        seen_guids.add(guid)
+        entry.id = guid
+        unique_entries.append(entry)
+
+    feed_data.entries = unique_entries
     return feed_data
 
 

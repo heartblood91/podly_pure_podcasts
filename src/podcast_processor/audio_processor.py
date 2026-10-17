@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, List, Optional, Tuple
 
 from app.extensions import db
@@ -317,7 +318,13 @@ class AudioProcessor:
             return [*ad_segments[:-1], (ad_segments[-1][0], audio_duration_seconds)]
         return ad_segments
 
-    def process_audio(self, post: Post, output_path: str) -> None:
+    def process_audio(
+        self,
+        post: Post,
+        output_path: str,
+        *,
+        ad_segments_override: Optional[List[Tuple[float, float]]] = None,
+    ) -> None:
         """
         Process the podcast audio by removing ad segments.
 
@@ -325,7 +332,11 @@ class AudioProcessor:
             post: The Post object containing the podcast to process
             output_path: Path where the processed audio file should be saved
         """
-        ad_segments = self.get_ad_segments(post)
+        ad_segments = (
+            self.get_ad_segments(post)
+            if ad_segments_override is None
+            else list(ad_segments_override)
+        )
 
         duration_ms = get_audio_duration_ms(post.unprocessed_audio_path)
         if duration_ms is None:
@@ -347,10 +358,14 @@ class AudioProcessor:
             ),
         )
 
+        fade_ms = self.config.output.fade_ms
+        if ad_segments_override is not None:
+            fade_ms = int(os.environ.get("PODLY_ACOUSTIC_FADE_MS", "40"))
+
         clip_segments_with_fade(
             in_path=post.unprocessed_audio_path,
             ad_segments_ms=merged_ad_segments,
-            fade_ms=self.config.output.fade_ms,
+            fade_ms=fade_ms,
             out_path=output_path,
         )
 

@@ -3,7 +3,7 @@ import os
 import shutil
 import threading
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import litellm
 from jinja2 import Template
@@ -13,6 +13,7 @@ from app.extensions import db
 from app.models import Post, ProcessingJob, TranscriptSegment
 from app.writer.client import writer_client
 from podcast_processor.ad_classifier import AdClassifier
+from podcast_processor.acoustic_detector import detect_and_plan
 from podcast_processor.audio_processor import AudioProcessor
 from podcast_processor.podcast_downloader import PodcastDownloader, sanitize_title
 from podcast_processor.processing_status_manager import ProcessingStatusManager
@@ -335,22 +336,57 @@ class PodcastProcessor:
             job: The ProcessingJob for tracking
             processed_audio_path: Path where the processed audio will be saved
         """
-        # Step 2: Transcribe audio
-        self.status_manager.update_job_status(
-            job, "running", 2, "Transcribing audio", 50.0
-        )
-        transcript_segments = self.transcription_manager.transcribe(post)
-        self._raise_if_cancelled(job, 2, cancel_callback)
+        acoustic_segments: Optional[List[Tuple[float, float]]] = None
+        if self._acoustic_only_enabled():
+            self.status_manager.update_job_status(
+                job, "running", 2, "Detecting acoustic ad cues", 50.0
+            )
+            cue_path = Path(
+                os.environ.get(
+                    "PODLY_ACOUSTIC_CUE_PATH",
+                    "/app/src/podcast_processor/cues/acast-cue-b.wav",
+                )
+            )
+            threshold = float(os.environ.get("PODLY_ACOUSTIC_THRESHOLD", "0.90"))
+            plan = detect_and_plan(
+                Path(post.unprocessed_audio_path),
+                cue_path,
+                threshold=threshold,
+            )
+            acoustic_segments = list(plan.cuts)
+            self.logger.info(
+                "Acoustic plan for post %s: matches=%d cuts=%s abstained=%s reason=%s",
+                post.id,
+                len(plan.matches),
+                acoustic_segments,
+                plan.abstained,
+                plan.reason,
+            )
+            self.status_manager.update_job_status(
+                job, "running", 3, "Acoustic ad plan ready", 75.0
+            )
+            self._raise_if_cancelled(job, 3, cancel_callback)
+        else:
+            # Step 2: Transcribe audio
+            self.status_manager.update_job_status(
+                job, "running", 2, "Transcribing audio", 50.0
+            )
+            transcript_segments = self.transcription_manager.transcribe(post)
+            self._raise_if_cancelled(job, 2, cancel_callback)
 
-        # Step 3: Classify ad segments
-        self._classify_ad_segments(post, job, transcript_segments)
-        self._raise_if_cancelled(job, 3, cancel_callback)
+            # Step 3: Classify ad segments
+            self._classify_ad_segments(post, job, transcript_segments)
+            self._raise_if_cancelled(job, 3, cancel_callback)
 
         # Step 4: Process audio (remove ad segments)
         self.status_manager.update_job_status(
             job, "running", 4, "Processing audio", 90.0
         )
-        self.audio_processor.process_audio(post, processed_audio_path)
+        self.audio_processor.process_audio(
+            post,
+            processed_audio_path,
+            ad_segments_override=acoustic_segments,
+        )
 
         # Update the database with the processed audio path
         self._remove_unprocessed_audio(post)
@@ -370,6 +406,15 @@ class PodcastProcessor:
         self.status_manager.update_job_status(
             job, "completed", 4, "Processing complete", 100.0
         )
+
+    @staticmethod
+    def _acoustic_only_enabled() -> bool:
+        return os.environ.get("PODLY_ACOUSTIC_ONLY", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
     def _raise_if_cancelled(
         self,

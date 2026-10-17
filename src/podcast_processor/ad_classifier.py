@@ -880,11 +880,13 @@ class AdClassifier:
     def _adjust_confidence(
         self, *, base_confidence: float, content_type: Optional[str]
     ) -> float:
-        """Demote confidence for self-promo/educational contexts."""
+        """Adjust confidence based on the detected content type."""
         if not content_type:
             return base_confidence
 
-        if content_type in {"educational/self_promo", "technical_discussion"}:
+        if content_type == "educational/self_promo":
+            return base_confidence
+        if content_type == "technical_discussion":
             return max(0.0, base_confidence - 0.25)
         if content_type == "transition":
             return max(0.0, base_confidence - 0.1)
