@@ -3,10 +3,7 @@ import os
 from typing import Any, Dict
 
 import flask
-import litellm
 from flask import Blueprint, jsonify, request
-from groq import Groq
-from openai import OpenAI
 
 from app.auth.guards import require_admin
 from app.config_store import read_combined, to_pydantic_config
@@ -458,6 +455,8 @@ def api_test_llm() -> flask.Response:
         )
 
     try:
+        import litellm  # pylint: disable=import-outside-toplevel
+
         # Configure litellm for this probe
         litellm.api_key = api_key
         if base_url:
@@ -590,6 +589,8 @@ def _test_remote_whisper(whisper_cfg: Dict[str, Any]) -> flask.Response:
     if not api_key:
         return _make_error_response("Missing whisper.api_key")
 
+    from openai import OpenAI  # pylint: disable=import-outside-toplevel
+
     _ = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout).models.list()
     return _make_success_response("Remote whisper connection OK", base_url=base_url)
 
@@ -606,6 +607,8 @@ def _test_groq_whisper(whisper_cfg: Dict[str, Any]) -> flask.Response:
 
     if not groq_api_key:
         return _make_error_response("Missing whisper.api_key")
+
+    from groq import Groq  # pylint: disable=import-outside-toplevel
 
     _ = Groq(api_key=groq_api_key).models.list()
     return _make_success_response("Groq whisper connection OK")

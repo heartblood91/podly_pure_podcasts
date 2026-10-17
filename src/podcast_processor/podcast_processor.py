@@ -5,23 +5,16 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-import litellm
 from jinja2 import Template
 from sqlalchemy.orm import object_session
 
 from app.extensions import db
 from app.models import Post, ProcessingJob, TranscriptSegment
 from app.writer.client import writer_client
-from podcast_processor.ad_classifier import AdClassifier
 from podcast_processor.acoustic_detector import detect_and_plan
 from podcast_processor.audio_processor import AudioProcessor
 from podcast_processor.podcast_downloader import PodcastDownloader, sanitize_title
 from podcast_processor.processing_status_manager import ProcessingStatusManager
-from podcast_processor.prompt import (
-    DEFAULT_SYSTEM_PROMPT_PATH,
-    DEFAULT_USER_PROMPT_TEMPLATE_PATH,
-)
-from podcast_processor.transcription_manager import TranscriptionManager
 from shared.config import Config
 from shared.processing_paths import (
     ProcessingPaths,
@@ -83,8 +76,8 @@ class PodcastProcessor:
         self,
         config: Config,
         logger: Optional[logging.Logger] = None,
-        transcription_manager: Optional[TranscriptionManager] = None,
-        ad_classifier: Optional[AdClassifier] = None,
+        transcription_manager: Optional[Any] = None,
+        ad_classifier: Optional[Any] = None,
         audio_processor: Optional[AudioProcessor] = None,
         status_manager: Optional[ProcessingStatusManager] = None,
         db_session: Optional[Any] = None,
@@ -104,24 +97,53 @@ class PodcastProcessor:
             self.db_session, self.logger
         )
 
-        litellm.api_base = self.config.openai_base_url
-        litellm.api_key = self.config.llm_api_key
-
-        # Initialize components with default implementations if not provided
-        if transcription_manager is None:
-            self.transcription_manager = TranscriptionManager(self.logger, config)
-        else:
-            self.transcription_manager = transcription_manager
-
-        if ad_classifier is None:
-            self.ad_classifier = AdClassifier(config)
-        else:
-            self.ad_classifier = ad_classifier
+        # Transcription and LLM classification (and their LiteLLM/OpenAI/Groq
+        # dependencies) are only built on the non-acoustic path, see the
+        # lazy properties below. Typed as Any because beartype resolves hints
+        # at call time and these modules are intentionally not imported here.
+        self._transcription_manager = transcription_manager
+        self._ad_classifier = ad_classifier
 
         if audio_processor is None:
             self.audio_processor = AudioProcessor(config=config, logger=self.logger)
         else:
             self.audio_processor = audio_processor
+
+    @property
+    def transcription_manager(self) -> Any:
+        if self._transcription_manager is None:
+            # pylint: disable=import-outside-toplevel
+            from podcast_processor.transcription_manager import TranscriptionManager
+
+            self._configure_litellm()
+            self._transcription_manager = TranscriptionManager(
+                self.logger, self.config
+            )
+        return self._transcription_manager
+
+    @transcription_manager.setter
+    def transcription_manager(self, value: Any) -> None:
+        self._transcription_manager = value
+
+    @property
+    def ad_classifier(self) -> Any:
+        if self._ad_classifier is None:
+            # pylint: disable=import-outside-toplevel
+            from podcast_processor.ad_classifier import AdClassifier
+
+            self._configure_litellm()
+            self._ad_classifier = AdClassifier(self.config)
+        return self._ad_classifier
+
+    @ad_classifier.setter
+    def ad_classifier(self, value: Any) -> None:
+        self._ad_classifier = value
+
+    def _configure_litellm(self) -> None:
+        import litellm  # pylint: disable=import-outside-toplevel
+
+        litellm.api_base = self.config.openai_base_url
+        litellm.api_key = self.config.llm_api_key
 
     # pylint: disable=too-many-branches, too-many-statements
     def process(
@@ -443,6 +465,12 @@ class PodcastProcessor:
             job: The ProcessingJob for tracking
             transcript_segments: The transcript segments to classify
         """
+        # pylint: disable=import-outside-toplevel
+        from podcast_processor.prompt import (
+            DEFAULT_SYSTEM_PROMPT_PATH,
+            DEFAULT_USER_PROMPT_TEMPLATE_PATH,
+        )
+
         self.status_manager.update_job_status(
             job, "running", 3, "Identifying ads", 75.0
         )
