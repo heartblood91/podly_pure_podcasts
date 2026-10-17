@@ -1,4 +1,7 @@
+import logging
 import os
+import threading
+import time
 import uuid
 from queue import Empty
 from typing import Any, Callable, Dict, Optional, cast
@@ -9,16 +12,73 @@ from app.ipc import make_client_manager
 from app.writer.model_ops import execute_model_command
 from app.writer.protocol import WriteCommand, WriteCommandType, WriteResult
 
+logger = logging.getLogger("global_logger")
+
+_CONNECTION_ERRORS = (ConnectionError, EOFError, OSError)
+
 
 class WriterClient:
+    """IPC client for the writer process.
+
+    Every ``manager.Queue()`` proxy that reaches the writer is pinned forever in
+    the manager server's ``id_to_local_proxy_obj`` (CPython never releases
+    manager-owned proxies). Reply queues are therefore created once per thread
+    and reused, so the number of retained queues is bounded by the number of
+    threads instead of growing with every call.
+    """
+
     def __init__(self) -> None:
         self.manager: Any = None
         self.queue: Any = None
+        self._lock = threading.Lock()
+        self._local = threading.local()
+        # Bumped on every (re)connect so reply queues bound to a previous
+        # manager connection are never reused.
+        self._generation = 0
 
     def connect(self) -> None:
+        with self._lock:
+            if not self.manager:
+                manager = make_client_manager()
+                self.queue = manager.get_command_queue()  # pylint: disable=no-member
+                self.manager = manager
+                self._generation += 1
+
+    def _invalidate(self) -> None:
+        with self._lock:
+            self.manager = None
+            self.queue = None
+            self._generation += 1
+
+    def _get_reply_queue(self) -> Any:
+        reply_q = getattr(self._local, "reply_queue", None)
+        if reply_q is not None and self._local.generation == self._generation:
+            return reply_q
         if not self.manager:
-            self.manager = make_client_manager()
-            self.queue = self.manager.get_command_queue()  # pylint: disable=no-member
+            raise RuntimeError("Manager not connected")
+        reply_q = self.manager.Queue()  # pylint: disable=no-member
+        self._local.reply_queue = reply_q
+        self._local.generation = self._generation
+        return reply_q
+
+    def _await_reply(self, reply_q: Any, command_id: str, timeout: float) -> Any:
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Writer service did not respond")
+            try:
+                result = reply_q.get(timeout=remaining)
+            except Empty as exc:
+                raise TimeoutError("Writer service did not respond") from exc
+            if getattr(result, "command_id", None) == command_id:
+                return result
+            # Late reply for a command that already timed out on this thread.
+            logger.warning(
+                "Discarding stale writer reply: expected=%s got=%s",
+                command_id,
+                getattr(result, "command_id", None),
+            )
 
     def _should_use_local_fallback(self) -> bool:
         if os.environ.get("PYTEST_CURRENT_TEST"):
@@ -137,21 +197,20 @@ class WriterClient:
                     return result if wait else None
                 raise
 
-        if wait:
-            if not self.manager:
-                raise RuntimeError("Manager not connected")
-            # Create a temporary queue for the reply
-            reply_q = self.manager.Queue()  # pylint: disable=no-member
+        try:
+            reply_q = self._get_reply_queue() if wait else None
             cmd.reply_queue = reply_q
-
-        if self.queue:
-            self.queue.put(cmd)
-
-        if wait:
-            try:
-                return reply_q.get(timeout=timeout)  # type: ignore
-            except Empty as exc:
-                raise TimeoutError("Writer service did not respond") from exc
+            if self.queue:
+                self.queue.put(cmd)
+            if reply_q is not None:
+                return self._await_reply(reply_q, cmd.id, timeout)  # type: ignore[no-any-return]
+        except TimeoutError:
+            raise
+        except _CONNECTION_ERRORS:
+            # The writer went away: drop the manager and every per-thread reply
+            # queue bound to it; the next call reconnects.
+            self._invalidate()
+            raise
         return None
 
     def create(
